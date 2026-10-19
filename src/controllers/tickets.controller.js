@@ -907,19 +907,128 @@ const create_ticket_v3 = async (req, res, next) => {
 
 
 
+// ----------------------------------------------------------------------
+// Auditoría de tickets
+//
+// project-open no audita con un trigger: lo hace desde la capa Tcl, en
+// im_audit_impl (packages/intranet-core/tcl/intranet-audit-procs.tcl).
+// Al escribir im_tickets por fuera de la aplicación, el audit no se genera
+// y el historial queda desfasado del estado real. project-open lo detecta
+// recién cuando alguien abre el ticket, y ahí escribe un audit atrasado
+// con la fecha de la apertura y el usuario que estaba mirando.
+//
+// Estas funciones replican el formato que usa im_audit_impl para que el
+// audit se escriba en el momento del cambio y con el usuario correcto.
+// ----------------------------------------------------------------------
+
+// Columnas de im_tickets que este endpoint puede modificar.
+// Actúa como lista blanca: nada fuera de acá llega al UPDATE.
+const CAMPOS_AUDITABLES = {
+    ticket_status_id: "number",
+    ticket_quoted_hours: "number",
+    ticket_solution: "text",
+    ticket_service_catalog_new: "number",
+    ticket_solution_category_new: "number"
+};
+
+// El audit_value usa \n y \t como separadores, así que hay que escaparlos
+// dentro de los valores. Mismo criterio que im_audit_object_value.
+const normalizarValor = (valor) => {
+    if (valor === null || valor === undefined) return "";
+    return String(valor).replace(/\n/g, "\\n").replace(/\t/g, "\\t");
+};
+
+// El audit_value es una línea por campo con el formato: clave \t valor
+const parsearValor = (texto) => {
+    const mapa = new Map();
+    if (!texto) return mapa;
+    for (const linea of texto.split("\n")) {
+        const corte = linea.indexOf("\t");
+        if (corte < 0) continue;
+        mapa.set(linea.slice(0, corte), linea.slice(corte + 1));
+    }
+    return mapa;
+};
+
+// Arma el audit_value nuevo a partir del anterior, reemplazando solo las
+// líneas de los campos que cambiaron.
+//
+// Se parte del valor que escribió project-open en vez de regenerarlo porque
+// im_audit_object_value hace un "select *" sobre la tabla del ticket unida a
+// sus tablas de extensión, y además agrega las relaciones del objeto.
+// Partiendo del anterior se conserva el orden de columnas, las líneas de
+// relaciones y las columnas duplicadas que produce ese join.
+const aplicarCambios = (valorPrevio, cambios) => {
+    const claves = new Set(Object.keys(cambios));
+    const encontradas = new Set();
+
+    const lineas = valorPrevio.split("\n").map((linea) => {
+        const corte = linea.indexOf("\t");
+        if (corte < 0) return linea;
+        const clave = linea.slice(0, corte);
+        if (!claves.has(clave)) return linea;
+        encontradas.add(clave);
+        return clave + "\t" + normalizarValor(cambios[clave]);
+    });
+
+    // Un campo que no estaba en el valor anterior se agrega al final.
+    for (const clave of claves) {
+        if (!encontradas.has(clave)) {
+            lineas.push(clave + "\t" + normalizarValor(cambios[clave]));
+        }
+    }
+
+    return lineas.join("\n");
+};
+
+// Devuelve solo las líneas cuyo valor cambió. Equivale a
+// im_audit_calculate_diff. Si no cambió nada devuelve cadena vacía, y en ese
+// caso no se escribe audit.
+const calcularDiff = (valorPrevio, valorNuevo) => {
+    const previo = parsearValor(valorPrevio);
+    let diff = "";
+
+    for (const linea of valorNuevo.split("\n")) {
+        const corte = linea.indexOf("\t");
+        if (corte < 0) continue;
+        const clave = linea.slice(0, corte);
+        const valor = linea.slice(corte + 1);
+        const anterior = previo.has(clave) ? previo.get(clave) : "";
+        if (valor !== anterior) diff += linea + "\n";
+    }
+
+    return diff;
+};
+
+/**
+ * PUT /update_ticket/:ticket_id
+ *
+ * Actualiza un ticket y deja el rastro de auditoría que espera project-open.
+ * Todo ocurre dentro de una transacción: si algo falla, el ticket no queda
+ * actualizado sin su audit.
+ *
+ * Body: ticket_status_id, ticket_quoted_hours y ticket_solution son
+ * obligatorios. ticket_service_catalog_new, ticket_solution_category_new y
+ * user_email son opcionales. Sin user_email el audit queda con usuario 0.
+ */
 const update_ticket = async (req, res, next) => {
+    const client = await pool.connect();
+
     try {
-        const ticket_id = req.params.ticket_id;
+        const ticket_id = Number(req.params.ticket_id);
+
+        if (!Number.isInteger(ticket_id) || ticket_id <= 0) {
+            return res.status(400).json({ error: "ticket_id inválido" });
+        }
 
         const {
             ticket_status_id,
             ticket_quoted_hours,
             ticket_solution,
             ticket_service_catalog_new,
-            ticket_solution_category_new
+            ticket_solution_category_new,
+            user_email
         } = req.body;
-
-        console.log("cuerpo", req.body);
 
         // Validar campos obligatorios
         if (
@@ -932,35 +1041,162 @@ const update_ticket = async (req, res, next) => {
             });
         }
 
-        // Construcción dinámica del UPDATE
-        let fields = [];
+        // Filtrar contra la lista blanca y validar tipos.
+        const entrada = {
+            ticket_status_id,
+            ticket_quoted_hours,
+            ticket_solution,
+            ticket_service_catalog_new,
+            ticket_solution_category_new
+        };
 
-        // Obligatorios
-        fields.push(`ticket_status_id = ${ticket_status_id}`);
-        fields.push(`ticket_quoted_hours = ${ticket_quoted_hours}`);
-        fields.push(`ticket_solution = '${ticket_solution}'`);
+        const cambios = {};
+        for (const [columna, tipo] of Object.entries(CAMPOS_AUDITABLES)) {
+            const valor = entrada[columna];
+            if (valor === undefined) continue;
 
-        // Opcionales
-        if (ticket_service_catalog_new !== undefined) {
-            fields.push(`ticket_service_catalog_new = ${ticket_service_catalog_new}`);
+            if (tipo === "number" && valor !== null && Number.isNaN(Number(valor))) {
+                return res.status(400).json({ error: `${columna} debe ser numérico` });
+            }
+            cambios[columna] = tipo === "number" && valor !== null ? Number(valor) : valor;
         }
 
-        if (ticket_solution_category_new !== undefined) {
-            fields.push(`ticket_solution_category_new = ${ticket_solution_category_new}`);
+        await client.query("BEGIN");
+
+        // 1. Resolver el usuario que origina el cambio.
+        //    users.username guarda el email, igual que en getOpenTicketsEmail.
+        let audit_user_id = 0;
+        if (user_email) {
+            const { rows } = await client.query(
+                `SELECT u.user_id
+                   FROM users u
+                   INNER JOIN im_employees e ON u.user_id = e.employee_id
+                  WHERE u.username = $1`,
+                [user_email]
+            );
+            if (rows.length > 0) audit_user_id = rows[0].user_id;
         }
 
-        const query = `
-            UPDATE im_tickets
-            SET ${fields.join(", ")}
-            WHERE ticket_id = ${ticket_id}
-        `;
+        const audit_ip =
+            (req.headers["x-forwarded-for"] || "").split(",")[0].trim() ||
+            req.socket?.remoteAddress ||
+            "0.0.0.0";
 
-        await pool.query(query);
+        // 2. Leer el estado anterior.
+        //    im_audit_impl lo saca de acs_objects.last_audit_id, que apunta al
+        //    último audit del objeto, no del último registro de im_audits.
+        const previo = await client.query(
+            `SELECT a.audit_value AS old_value,
+                    o.last_audit_id
+               FROM acs_objects o
+               LEFT JOIN im_audits a ON a.audit_id = o.last_audit_id
+              WHERE o.object_id = $1`,
+            [ticket_id]
+        );
 
-        res.status(200).json({ message: "Ticket updated successfully" });
+        if (previo.rows.length === 0) {
+            await client.query("ROLLBACK");
+            return res.status(404).json({ error: "El ticket no existe" });
+        }
+
+        const old_value = previo.rows[0].old_value || "";
+        const last_audit_id = previo.rows[0].last_audit_id;
+
+        // 3. Guardar el cambio. Parametrizado: los valores nunca se concatenan
+        //    dentro del texto de la consulta.
+        const columnas = Object.keys(cambios);
+        const asignaciones = columnas.map((c, i) => `${c} = $${i + 1}`);
+        const valores = columnas.map((c) => cambios[c]);
+
+        await client.query(
+            `UPDATE im_tickets
+                SET ${asignaciones.join(", ")}
+              WHERE ticket_id = $${columnas.length + 1}`,
+            [...valores, ticket_id]
+        );
+
+        // 4. Escribir la auditoría.
+        //    Sin valor anterior no hay con qué comparar: se deja constancia en
+        //    el log y el UPDATE se conserva. No debería pasar, porque todo
+        //    ticket nace con un audit after_create.
+        let audit_id = null;
+
+        if (old_value) {
+            const new_value = aplicarCambios(old_value, cambios);
+            const diff = calcularDiff(old_value, new_value);
+
+            if (diff !== "") {
+                // audit_id sale de la secuencia de project-open y el estado lo
+                // resuelve su propia función, para no inventar valores.
+                const insertado = await client.query(
+                    `INSERT INTO im_audits (
+                        audit_id,
+                        audit_object_id,
+                        audit_object_status_id,
+                        audit_action,
+                        audit_user_id,
+                        audit_date,
+                        audit_ip,
+                        audit_last_id,
+                        audit_ref_object_id,
+                        audit_value,
+                        audit_diff,
+                        audit_note,
+                        audit_hash
+                     ) VALUES (
+                        nextval('im_audit_seq'),
+                        $1,
+                        im_biz_object__get_status_id($1),
+                        'after_update',
+                        $2,
+                        now(),
+                        $3,
+                        $4,
+                        NULL,
+                        $5,
+                        $6,
+                        NULL,
+                        NULL
+                     )
+                     RETURNING audit_id`,
+                    [ticket_id, audit_user_id, audit_ip, last_audit_id, new_value, diff]
+                );
+
+                audit_id = insertado.rows[0].audit_id;
+
+                // 5. Mover el puntero del objeto al audit nuevo. Este paso es el
+                //    que evita que project-open escriba un audit atrasado la
+                //    próxima vez que alguien abra el ticket.
+                await client.query(
+                    `UPDATE acs_objects
+                        SET last_audit_id  = $1,
+                            last_modified  = now(),
+                            modifying_user = $2,
+                            modifying_ip   = $3
+                      WHERE object_id = $4`,
+                    [audit_id, audit_user_id, audit_ip, ticket_id]
+                );
+            }
+        } else {
+            console.warn(
+                `update_ticket: el ticket ${ticket_id} no tiene audit previo en ` +
+                `acs_objects.last_audit_id. Se actualizó sin escribir auditoría.`
+            );
+        }
+
+        await client.query("COMMIT");
+
+        return res.status(200).json({
+            message: "Ticket updated successfully",
+            audit_id: audit_id
+        });
 
     } catch (err) {
-        next(err);
+        await client.query("ROLLBACK");
+        console.error("update_ticket:", err);
+        return next(err);
+    } finally {
+        client.release();
     }
 };
 
