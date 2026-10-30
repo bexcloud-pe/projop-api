@@ -1,16 +1,12 @@
-const session = require('express-session');
 const config = require('./config/config.js');
-const bodyParser = require('body-parser');
 const cors = require('cors');
 const express = require('express');
 const app = express();
 
-const memoryStore = new session.MemoryStore();
-
 // Middlewares
 app.use(cors({ origin: true, credentials: true }));
-app.use(bodyParser.urlencoded({ extended: false }));
-app.use(bodyParser.json());
+app.use(express.urlencoded({ extended: false }));
+app.use(express.json());
 
 
 // Importación de routers modularizados
