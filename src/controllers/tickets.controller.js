@@ -1077,10 +1077,11 @@ const update_ticket = async (req, res, next) => {
             if (rows.length > 0) audit_user_id = rows[0].user_id;
         }
 
-        const audit_ip =
-            (req.headers["x-forwarded-for"] || "").split(",")[0].trim() ||
-            req.socket?.remoteAddress ||
-            "0.0.0.0";
+        // req.ip respeta el 'trust proxy' configurado en app.js y descarta los
+        // saltos que el cliente agregue a X-Forwarded-For. Leer la cabecera a
+        // mano tomaba el primer valor, que es el que el llamante controla.
+        // audit_ip es varchar(50) en im_audits.
+        const audit_ip = (req.ip || "0.0.0.0").replace(/^::ffff:/, "").slice(0, 50);
 
         // 2. Leer el estado anterior.
         //    im_audit_impl lo saca de acs_objects.last_audit_id, que apunta al
