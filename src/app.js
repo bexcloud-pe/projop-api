@@ -1,16 +1,18 @@
-const session = require('express-session');
 const config = require('./config/config.js');
-const bodyParser = require('body-parser');
 const cors = require('cors');
 const express = require('express');
 const app = express();
 
-const memoryStore = new session.MemoryStore();
+// Cantidad de proxies propios delante de la aplicación. Express descarta esa
+// cantidad de saltos desde el final de X-Forwarded-For y toma el siguiente como
+// req.ip, así los saltos que agregue el cliente quedan fuera. Un valor mayor al
+// real permitiría falsificar la IP, por eso no se usa 'true'.
+app.set('trust proxy', Number(config.TRUST_PROXY_HOPS) || 1);
 
 // Middlewares
 app.use(cors({ origin: true, credentials: true }));
-app.use(bodyParser.urlencoded({ extended: false }));
-app.use(bodyParser.json());
+app.use(express.urlencoded({ extended: false }));
+app.use(express.json());
 
 
 // Importación de routers modularizados

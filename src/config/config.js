@@ -13,4 +13,7 @@ module.exports = {
     DB_PASSWORD : process.env.DB_PASSWORD,
     DB_DATABASE : process.env.DB_DATABASE,
     DB_PORT : process.env.DB_PORT,
+    // Cantidad de proxies propios delante de la aplicación (Cloud Run agrega 1).
+    // Define cuántos saltos de X-Forwarded-For se consideran confiables.
+    TRUST_PROXY_HOPS : process.env.TRUST_PROXY_HOPS,
 }
