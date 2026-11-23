@@ -16,6 +16,8 @@ const {
   ticket_type,
   getTicketsByCompanyId
 } = require('../controllers/tickets.controller');
+const { createTicket } = require('../controllers/create-ticket.controller');
+const { addTicketMembers } = require('../controllers/add-ticket-members.controller');
 
 // Rutas de tickets
 
@@ -25,6 +27,8 @@ router.get('/ticketsHelpDesk/:person_id/:fecha_inicial/:fecha_final', getTickets
 router.get('/open-tickets/:user_email', getOpenTicketsEmail);
 router.get('/ticketsByCompanyUser/:company_id', getTicketsByCompanyId);
 
+router.post('/tickets', createTicket);
+router.post('/tickets/:ticketId/members', addTicketMembers);
 router.post('/tickets/create_ticket', create_ticket);
 router.put('/update_ticket/:ticket_id', update_ticket);
 router.get('/tickets/status_ticket', status_ticket);
