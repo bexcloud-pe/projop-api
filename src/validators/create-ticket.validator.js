@@ -16,9 +16,18 @@ const MAX_MEMBER_IDS = 50;
 const isNonEmptyString = (v) => typeof v === 'string' && v.trim() !== '';
 
 // ISO-8601 date or date-time, e.g. 2026-11-30 or 2026-11-30T17:00:00Z.
+// Also accepts the PostgreSQL timestamptz output returned by the ]po[ REST API,
+// e.g. 2026-05-31 00:00:00-05 (offset without minutes).
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}(:?\d{2})?)?)?$/;
-const isIsoDate = (v) =>
-  typeof v === 'string' && ISO_DATE_RE.test(v) && !Number.isNaN(Date.parse(v.replace(' ', 'T')));
+
+// Date.parse needs "T" as the separator and the offset as +HH:MM.
+const toParsableDate = (v) => {
+  const s = v.replace(' ', 'T');
+  if (!s.includes('T')) return s;
+  return s.replace(/([+-]\d{2}):?(\d{2})?$/, (match, hours, minutes) => `${hours}:${minutes || '00'}`);
+};
+
+const isIsoDate = (v) => typeof v === 'string' && ISO_DATE_RE.test(v) && !Number.isNaN(Date.parse(toParsableDate(v)));
 
 // Field kinds. Each returns an error message, or null when the value is valid.
 const KINDS = {
