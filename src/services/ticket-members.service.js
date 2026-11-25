@@ -43,6 +43,13 @@ const addRole = async (client, userId, objectId, roleId, creatorUserId, ip, dept
   if (object.rows.length === 0) return null;
   const objectType = object.rows[0].object_type;
 
+  // Serialize concurrent transactions adding the same user to the same object
+  // (e.g. two new tickets of one SLA propagating the same assignee to the SLA).
+  // Without it both see "no rel" and the second insert violates acs_object_rels_un.
+  // Released automatically at COMMIT/ROLLBACK. Callers must add users in
+  // ascending id order so two transactions never wait for each other.
+  await client.query('SELECT pg_advisory_xact_lock($1::integer, $2::integer)', [objectId, userId]);
+
   const existing = await client.query(
     `SELECT r.rel_id, bom.percentage, bom.object_role_id
        FROM acs_rels r, im_biz_object_members bom
@@ -108,16 +115,18 @@ const addRole = async (client, userId, objectId, roleId, creatorUserId, ip, dept
 const addFullMemberToTicket = (client, ticketId, userId, creatorUserId, ip) =>
   addRole(client, userId, ticketId, ROLE_FULL_MEMBER, creatorUserId, ip);
 
-// Members of a new ticket, in order and without duplicates:
-//  1. the creator (im_ticket::new),
-//  2. the assignee (intranet-helpdesk/www/new.tcl, "Add a new assignee to the members"),
-//  3. any additional memberIds (e.g. the members of the ticket being cloned).
-const addTicketMembers = async (client, ticketId, { creatorUserId, assigneeId, memberIds = [] }, ip) => {
-  const userIds = new Set([creatorUserId]);
-  if (assigneeId !== undefined) userIds.add(assigneeId);
-  memberIds.forEach((id) => userIds.add(id));
+// Ascending, without duplicates: the lock order addRole relies on.
+const inLockOrder = (userIds) => Array.from(new Set(userIds)).sort((a, b) => a - b);
 
-  for (const userId of userIds) {
+// Members of a new ticket, without duplicates:
+//  - the creator (im_ticket::new),
+//  - the assignee (intranet-helpdesk/www/new.tcl, "Add a new assignee to the members"),
+//  - any additional memberIds (e.g. the members of the ticket being cloned).
+const addTicketMembers = async (client, ticketId, { creatorUserId, assigneeId, memberIds = [] }, ip) => {
+  const userIds = [creatorUserId, ...memberIds];
+  if (assigneeId !== undefined) userIds.push(assigneeId);
+
+  for (const userId of inLockOrder(userIds)) {
     await addFullMemberToTicket(client, ticketId, userId, creatorUserId, ip);
   }
 };
@@ -173,11 +182,9 @@ const addMembersToTicket = async ({ ticketId, userIds, actorUserId }, { ip }) =>
     await assertTicketExists(client, ticketId);
     await assertUsersExist(client, userIds, actorUserId);
 
-    // Serialize concurrent member additions on the same ticket.
-    await client.query("SELECT pg_advisory_xact_lock(hashtext('ticket-members'), $1::integer)", [ticketId]);
-
+    // Concurrency is handled per (object, user) inside addRole.
     const members = [];
-    for (const userId of userIds) {
+    for (const userId of inLockOrder(userIds)) {
       const result = await addRole(client, userId, ticketId, ROLE_FULL_MEMBER, actorUserId, ip);
       members.push({ userId, relId: result.relId, roleId: result.roleId, created: result.created });
     }
