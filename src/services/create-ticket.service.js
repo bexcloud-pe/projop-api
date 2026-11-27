@@ -96,9 +96,17 @@ const assertReferencesExist = async (client, input) => {
 
 // The SLA must exist and be a Ticket Container (project_type 2502).
 // Returns the SLA's company, which becomes the ticket's company (as in the TCL).
+//
+// FOR UPDATE makes concurrent tickets of the same SLA wait their turn here.
+// Without it, attaching the ticket to the SLA deadlocks on PostgreSQL 9.2: the
+// parent_id FK check takes a share lock on the SLA row, then the ]po[ trigger
+// im_projects_update_tr asks for FOR UPDATE on that same row to bump
+// max_child_sortkey, and two transactions wait on each other's share lock.
+// The row lock is released at COMMIT/ROLLBACK. Tickets of other SLAs still run
+// in parallel.
 const loadSla = async (client, slaId) => {
   const { rows } = await client.query(
-    'SELECT project_id, project_type_id, company_id FROM im_projects WHERE project_id = $1',
+    'SELECT project_id, project_type_id, company_id FROM im_projects WHERE project_id = $1 FOR UPDATE',
     [slaId]
   );
   if (rows.length === 0) {
